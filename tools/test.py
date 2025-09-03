@@ -187,15 +187,23 @@ def main():
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--view", choices=["original","canvas"], default="original")
 
-    ap.add_argument("--cam", type=str, default="0", help="Camera index (e.g. '0') OR device path (e.g. '/dev/video2') OR a GStreamer pipeline string")
-    ap.add_argument("--backend", choices=["auto", "v4l2", "gstreamer", "dshow", "mf"], default="v4l2", help="Capture backend to use")
+    # Camera-related args
+    ap.add_argument("--cam", type=str, default="0",
+                    help="Camera index (e.g. '0') OR device path (e.g. '/dev/video2') OR a GStreamer pipeline string")
+    ap.add_argument("--backend", choices=["auto", "v4l2", "gstreamer", "dshow", "mf"], default="v4l2",
+                    help="Capture backend to use")
     ap.add_argument("--fourcc", type=str, default="", help="Pixel format, e.g. MJPG, YUY2, H264 (if supported)")
     ap.add_argument("--fps", type=int, default=0, help="Try to set FPS (0 = leave default)")
 
     args = ap.parse_args()
 
+    # Enable CuDNN auto-tuner (for convs) and select device
+    torch.backends.cudnn.benchmark = True
+    device = torch.device(args.device)
+
+    # Map backend string to OpenCV constant
     backend_map = {
-        "auto": 0,
+        "auto": cv2.CAP_ANY,
         "v4l2": cv2.CAP_V4L2,
         "gstreamer": cv2.CAP_GSTREAMER,
         "dshow": cv2.CAP_DSHOW,
@@ -203,8 +211,13 @@ def main():
     }
     backend = backend_map[args.backend]
 
+    # Parse camera argument: int index or string path/pipeline
     cam_arg = int(args.cam) if args.cam.isdigit() else args.cam
 
+    # Open capture with chosen backend
+    cap = cv2.VideoCapture(cam_arg, backend)
+
+    # Try to configure stream properties (apply if supported)
     if args.fourcc:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*args.fourcc))
     if args.width:
@@ -215,20 +228,14 @@ def main():
         cap.set(cv2.CAP_PROP_FPS, args.fps)
 
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera: {args.cam}")
+        raise RuntimeError(f"Cannot open camera: {args.cam} (backend={args.backend})")
 
-    torch.backends.cudnn.benchmark = True
-    device = torch.device(args.device)
-
-    model, img_size, conf_thr0, nms_iou0, amp_dtype = load_model(args.config, args.weights, args.use_ema, device, args.amp)
+    # Load model + thresholds
+    model, img_size, conf_thr0, nms_iou0, amp_dtype = load_model(
+        args.config, args.weights, args.use_ema, device, args.amp
+    )
     conf_thr = float(args.conf) if args.conf is not None else conf_thr0
     nms_iou  = float(args.nms)  if args.nms  is not None else nms_iou0
-
-    cap = cv2.VideoCapture(args.cam)
-    if args.width:  cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
-    if args.height: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open webcam")
 
     print("Press q/ESC to quit. [/]=conf  ;/'=nms  o=toggle view  s=save")
     t_prev = time.time()
@@ -245,8 +252,11 @@ def main():
             canvas_rgb, meta = resize_and_center_crop_rgb(frame_rgb, img_size)
             inp = normalize_to_tensor(canvas_rgb, device)
 
-            with torch.no_grad(), torch.autocast(device_type=("cuda" if device.type=="cuda" else "cpu"),
-                                                 dtype=amp_dtype, enabled=(amp_dtype is not None and device.type=="cuda")):
+            with torch.no_grad(), torch.autocast(
+                device_type=("cuda" if device.type == "cuda" else "cpu"),
+                dtype=amp_dtype,
+                enabled=(amp_dtype is not None and device.type == "cuda")
+            ):
                 p_logits, boxes01 = model(inp)           # (1,N), (1,N,4)
                 scores = torch.sigmoid(p_logits[0])      # (N,)
                 boxes01 = boxes01[0]                     # (N,4)
@@ -267,7 +277,7 @@ def main():
                 boxes_canvas = np.empty((0,4), dtype=np.float32)
                 scores_np = np.empty((0,), dtype=np.float32)
 
-            # choose view & draw
+            # Choose view & draw
             if view_mode == "original":
                 img_show = frame_bgr.copy()
                 if boxes_canvas.size:
