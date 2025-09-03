@@ -101,10 +101,13 @@ def auto_fill_shifts(cfg: dict) -> None:
 #  I/O helpers
 # ---------------------------------------------------------------------
 
-def write_array(fh, arr: np.ndarray) -> int:
-    """Write array in native endianness; return file offset."""
+def write_array(fh, arr: np.ndarray, align: int = 1) -> int:
     arr = np.ascontiguousarray(arr)
     ofs = fh.tell()
+    pad = (align - (ofs % align)) % align
+    if pad:
+        fh.write(b"\x00" * pad)
+        ofs += pad
     fh.write(arr.tobytes())
     return ofs
 
@@ -178,6 +181,17 @@ def gen_header(cfg: dict,
         lines.append(f"#define SC_{name:<11} {sc_q15[name]}")
     lines.append("")
 
+    # opzionale: utili per post-proc detection
+    if "IMG" in cfg:   lines.append(f"#define MODEL_IMG        {cfg['IMG']}")
+    if "PATCH" in cfg: lines.append(f"#define MODEL_PATCH      {cfg['PATCH']}")
+    if "PATCHES" in cfg:
+        lines.append(f"#define MODEL_PATCHES   {cfg['PATCHES']}")  # = (IMG/PATCH)^2
+        lines.append(f"#define MODEL_GRID      {int(round(math.sqrt(int(cfg['PATCHES']))))}")
+
+    pe_shift = int(cfg["shifts"]["PE_SHIFT"])
+    lines.append(f"#define PE_SHIFT          {pe_shift}")
+    lines.append(f"#define PE_ACT_SCALE_Q24  {int(round(act_scale_pe * (1<<24)))}")
+
     lines += [
         "extern const uint8_t  weights_bin[];",
         "",
@@ -225,20 +239,52 @@ def main() -> None:
     }
     init_keys = list(TENSORS.keys())  # for debug messages
 
+    # ---- fallback by shape (for unnamed Constant weights) ----
+    used_weight_names = set()
+
+    def _is_2d_float(arr):
+        return isinstance(arr, np.ndarray) and arr.ndim == 2 and np.issubdtype(arr.dtype, np.floating)
+
+    def pop_linear_KxN(out_dim: int, in_dim: int, tag: str) -> np.ndarray:
+        """
+        Return weight in KxN layout (K=in_dim, N=out_dim).
+        Looks for (out_dim, in_dim) or (in_dim, out_dim) tensors among Constants/initializers.
+        Consumes the first match in insertion order to preserve layer ordering.
+        """
+        # candidate shapes in ONNX space (row = out_features, col = in_features)
+        shapes = {(out_dim, in_dim), (in_dim, out_dim)}
+        for name, arr in TENSORS.items():
+            if name in used_weight_names:
+                continue
+            if not _is_2d_float(arr):
+                continue
+            if tuple(arr.shape) in shapes:
+                used_weight_names.add(name)
+                w = arr.astype(np.float32)
+                # convert to KxN expected by packer (in_dim x out_dim)
+                if w.shape == (out_dim, in_dim):  # standard ONNX Linear: (out, in)
+                    w = w.T                       # -> (in, out) = KxN
+                # else already (in_dim, out_dim)
+                print(f"[fallback] {tag}: using unnamed {name} with shape {tuple(arr.shape)}")
+                return w
+        raise KeyError(f"[fallback] no 2D weight for {tag} with shapes {list(shapes)}")
+
     def _alias_ln_gamma_from_constants(TENSORS: Dict[str, np.ndarray], cfg: dict):
-        dm = int(cfg["DMODEL"])
-        L  = int(cfg["LAYERS"])
+        dm = int(cfg["DMODEL"]); L = int(cfg["LAYERS"])
         added = []
         for l in range(L):
             for ln_alias in ("ln1", "ln2"):
                 key = f"layers.{l}.{ln_alias}.g"
                 if key in TENSORS:
                     continue
-                prefix = f"/layers.{l}/{ln_alias}/Constant"
-                # prendi SOLO i Constant monodimensionali della giusta lunghezza
+                prefixes = (
+                    f"/layers.{l}/{ln_alias}/Constant",
+                    f"layers.{l}/{ln_alias}/Constant",
+                    f"layers.{l}.{ln_alias}.Constant",
+                )
                 cands = [name for name, arr in TENSORS.items()
                         if isinstance(arr, np.ndarray)
-                        and name.startswith(prefix)
+                        and any(name.startswith(p) for p in prefixes)
                         and arr.ndim == 1 and arr.shape[0] == dm
                         and np.issubdtype(arr.dtype, np.floating)]
                 if len(cands) == 1:
@@ -276,6 +322,11 @@ def main() -> None:
 
         q_pe, s_pe = sym_int8_quant(w_pe, per_channel=True, axis=1)
         w_ofs["W_PE"] = write_array(wfh, q_pe)
+
+        # Compute act-scale used to quantize CLS/APE in PatchEmbed domain
+        pe_shift     = int(cfg["shifts"]["PE_SHIFT"])
+        s_pe_max     = float(np.max(s_pe)) if np.ndim(s_pe) else float(s_pe)
+        act_scale_pe = s_pe_max / float(2 ** pe_shift)
         sc_q15["PE"]  = to_q15(1.0, float(np.max(s_pe)), cfg["shifts"]["PE_SHIFT"])
 
         b_pe = get_init(
@@ -283,12 +334,7 @@ def main() -> None:
             keys=("embed.proj.bias", "patch_embed.bias", "patch_embed.proj.bias", "embed.bias"),
             debug_all=init_keys
         )
-        w_ofs["B_PE"] = write_array(wfh, quantize_bias(b_pe, s_pe))
-
-        # Compute act-scale used to quantize CLS/APE in PatchEmbed domain
-        pe_shift     = int(cfg["shifts"]["PE_SHIFT"])
-        s_pe_max     = float(np.max(s_pe)) if np.ndim(s_pe) else float(s_pe)
-        act_scale_pe = s_pe_max / float(2 ** pe_shift)
+        w_ofs["B_PE"] = write_array(wfh, quantize_bias(b_pe, s_pe, in_scale=act_scale_pe), align=4)
 
         # CLS token (optional)
         cls = get_init(TENSORS, keys=("cls", "class_token", "cls_token"), required=False, debug_all=init_keys)
@@ -301,11 +347,14 @@ def main() -> None:
         L = cfg["LAYERS"]
         for l in range(L):
             # QKV fused
-            wqkv = get_init(
-                TENSORS,
-                keys=(f"layers.{l}.attn.qkv.weight", f"layers.{l}.attn.Wqkv.weight", f"layers.{l}.attn.W_qkv.weight"),
-                debug_all=init_keys
-            ).T                                                          # [DM, 3*DM] = K×N
+            try:
+                wqkv = get_init(
+                    TENSORS,
+                    keys=(f"layers.{l}.attn.qkv.weight", f"layers.{l}.attn.Wqkv.weight", f"layers.{l}.attn.W_qkv.weight"),
+                    debug_all=init_keys
+                ).T  # (DM, 3*DM)
+            except KeyError:
+                wqkv = pop_linear_KxN(out_dim=3*int(cfg["DMODEL"]), in_dim=int(cfg["DMODEL"]), tag=f"W_QKV_L{l}") # [DM, 3*DM] = K×N
             q, s = sym_int8_quant(wqkv, per_channel=True, axis=1)        # N=3*DM
             w_ofs[f"W_QKV_L{l}"] = write_array(wfh, q)
             sc_q15[f"QKV_L{l}"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["QKV_SHIFT"])
@@ -317,14 +366,17 @@ def main() -> None:
             )
             if b is None:
                 b = np.zeros(s.shape[0], dtype=np.float32)
-            w_ofs[f"B_QKV_L{l}"] = write_array(wfh, quantize_bias(b, s))
+            w_ofs[f"B_QKV_L{l}"] = write_array(wfh, quantize_bias(b, s), align=4)
 
             # Output projection
-            wo = get_init(
-                TENSORS,
-                keys=(f"layers.{l}.attn.proj.weight", f"layers.{l}.attn.out_proj.weight"),
-                debug_all=init_keys
-            ).T                                                          # [DM, DM] = K×N
+            try:
+                wo = get_init(
+                    TENSORS,
+                    keys=(f"layers.{l}.attn.proj.weight", f"layers.{l}.attn.out_proj.weight"),
+                    debug_all=init_keys
+                ).T
+            except KeyError:
+                wo = pop_linear_KxN(out_dim=int(cfg["DMODEL"]), in_dim=int(cfg["DMODEL"]), tag=f"W_O_L{l}") # [DM, DM] = K×N
             q, s = sym_int8_quant(wo, per_channel=True, axis=1)
             w_ofs[f"W_O_L{l}"] = write_array(wfh, q)
             sc_q15[f"MHA_O_L{l}"] = to_q15(1.0, float(np.max(s)), cfg["shifts"]["MHA_O_SHIFT"])
@@ -336,14 +388,17 @@ def main() -> None:
             )
             if b is None:
                 b = np.zeros(s.shape[0], dtype=np.float32)
-            w_ofs[f"B_O_L{l}"] = write_array(wfh, quantize_bias(b, s))
+            w_ofs[f"B_O_L{l}"] = write_array(wfh, quantize_bias(b, s), align=4)
 
             # FFN fc1
-            w1 = get_init(
-                TENSORS,
-                keys=(f"layers.{l}.ffn.fc1.weight", f"layers.{l}.mlp.fc1.weight"),
-                debug_all=init_keys
-            ).T                                                          # [DM, DFF] = K×N
+            try:
+                w1 = get_init(
+                    TENSORS,
+                    keys=(f"layers.{l}.ffn.fc1.weight", f"layers.{l}.mlp.fc1.weight"),
+                    debug_all=init_keys
+                ).T  # (DM, DFF)
+            except KeyError:
+                w1 = pop_linear_KxN(out_dim=int(cfg["DFF"]), in_dim=int(cfg["DMODEL"]), tag=f"W_FFN1_L{l}") # [DM, DFF] = K×N
             q, s = sym_int8_quant(w1, per_channel=True, axis=1)          # N=DFF
             w_ofs[f"W_FFN1_L{l}"] = write_array(wfh, q)
             sc_q15[f"FFN1_L{l}"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["FFN_SHIFT1"])
@@ -355,14 +410,17 @@ def main() -> None:
             )
             if b is None:
                 b = np.zeros(s.shape[0], dtype=np.float32)
-            w_ofs[f"B_FFN1_L{l}"] = write_array(wfh, quantize_bias(b, s))
+            w_ofs[f"B_FFN1_L{l}"] = write_array(wfh, quantize_bias(b, s), align=4)
 
             # FFN fc2
-            w2 = get_init(
-                TENSORS,
-                keys=(f"layers.{l}.ffn.fc2.weight", f"layers.{l}.mlp.fc2.weight"),
-                debug_all=init_keys
-            ).T                                                          # [DFF, DM] = K×N
+            try:
+                w2 = get_init(
+                    TENSORS,
+                    keys=(f"layers.{l}.ffn.fc2.weight", f"layers.{l}.mlp.fc2.weight"),
+                    debug_all=init_keys
+                ).T  # (DFF, DM)
+            except KeyError:
+                w2 = pop_linear_KxN(out_dim=int(cfg["DMODEL"]), in_dim=int(cfg["DFF"]), tag=f"W_FFN2_L{l}") # [DFF, DM] = K×N
             q, s = sym_int8_quant(w2, per_channel=True, axis=1)          # N=DM
             w_ofs[f"W_FFN2_L{l}"] = write_array(wfh, q)
             sc_q15[f"FFN2_L{l}"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["FFN_SHIFT2"])
@@ -374,7 +432,7 @@ def main() -> None:
             )
             if b is None:
                 b = np.zeros(s.shape[0], dtype=np.float32)
-            w_ofs[f"B_FFN2_L{l}"] = write_array(wfh, quantize_bias(b, s))
+            w_ofs[f"B_FFN2_L{l}"] = write_array(wfh, quantize_bias(b, s), align=4)
 
             # LayerNorm params: prefer weight/bias; fallback gamma/beta + alias .g/.b
             for ln_alias, tag in (("ln1", "LN1"), ("ln2", "LN2")):
@@ -447,23 +505,35 @@ def main() -> None:
         if pos is not None:
             if pos.ndim == 3 and pos.shape[0] == 1:
                 pos = pos[0]
-            pos = pos.reshape(cfg["TOKENS"], cfg["DMODEL"])
+            Tt_onnx, Dm_onnx = pos.shape
+            if "TOKENS" in cfg and int(cfg["TOKENS"]) != int(Tt_onnx):
+                print(f"[WARN] TOKENS in YAML={cfg['TOKENS']} ≠ ONNX={Tt_onnx} → uso ONNX")
+            cfg["TOKENS"] = int(Tt_onnx)
+            assert int(cfg["DMODEL"]) == int(Dm_onnx), "DMODEL mismatch vs pos_embed"
             # Quantizza APE nel dominio di PatchEmbed
             q_pos = quantize_act_global(pos, act_scale_pe).astype(np.int8)
-            w_ofs["POS_EMB"] = write_array(wfh, q_pos)   # => #define OFF_POS_EMB ...
+            w_ofs["POS_EMB"] = write_array(wfh, q_pos)
 
         # ---------------------------------------------------------------------
-        # Classifier head  [OUT_DIM, DMODEL] (ONNX out,in) → transpose to K×N
+        # Classifier / Detection head: [OUT_DIM, DMODEL] (ONNX out,in) → transpose K×N
         # ---------------------------------------------------------------------
-        w_head = get_init(TENSORS, keys=("head.weight",), debug_all=init_keys).T  # [DM, OUT]
-        q, s   = sym_int8_quant(w_head, per_channel=True, axis=1)                 # N=OUT
+        try:
+            w_head = get_init(TENSORS,
+                            keys=("head.weight", "head_det.weight", "head_det.out.weight"),
+                            debug_all=init_keys).T
+        except KeyError:
+            w_head = pop_linear_KxN(out_dim=int(cfg["OUT_DIM"]), in_dim=int(cfg["DMODEL"]), tag="HEAD_W")
+        q, s   = sym_int8_quant(w_head, per_channel=True, axis=1)     # N=OUT
         w_ofs["HEAD_W"] = write_array(wfh, q)
         sc_q15["HEAD"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["HEAD_SHIFT"])
 
-        b_head = get_init(TENSORS, keys=("head.bias",), required=False, debug_all=init_keys)
+        b_head = get_init(TENSORS,
+                        keys=("head.bias", "head_det.bias", "head_det.out.bias"),
+                        required=False, debug_all=init_keys)
         if b_head is None:
             b_head = np.zeros(s.shape[0], dtype=np.float32)
-        w_ofs["HEAD_B"] = write_array(wfh, quantize_bias(b_head, s))
+        w_ofs["HEAD_B"] = write_array(wfh, quantize_bias(b_head, s), align=4)
+
 
     # -------------------------------------------------------------------------
     # Runtime arena layout (token-major ping-pong)
@@ -492,3 +562,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# python tools/onnx2int8.py --model models/tinyvitdet.onnx --cfg models/tinyvitdet.yaml --out include/ --auto-shift
