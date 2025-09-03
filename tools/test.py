@@ -180,14 +180,42 @@ def main():
     ap.add_argument("--use-ema", action="store_true", help="load EMA weights if available")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--amp", choices=["off","bf16","fp16"], default="bf16")
-    ap.add_argument("--cam", type=int, default=0)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--conf", type=float, default=None, help="override confidence threshold")
     ap.add_argument("--nms", type=float, default=None, help="override NMS IoU")
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--view", choices=["original","canvas"], default="original")
+
+    ap.add_argument("--cam", type=str, default="0", help="Camera index (e.g. '0') OR device path (e.g. '/dev/video2') OR a GStreamer pipeline string")
+    ap.add_argument("--backend", choices=["auto", "v4l2", "gstreamer", "dshow", "mf"], default="v4l2", help="Capture backend to use")
+    ap.add_argument("--fourcc", type=str, default="", help="Pixel format, e.g. MJPG, YUY2, H264 (if supported)")
+    ap.add_argument("--fps", type=int, default=0, help="Try to set FPS (0 = leave default)")
+
     args = ap.parse_args()
+
+    backend_map = {
+        "auto": 0,
+        "v4l2": cv2.CAP_V4L2,
+        "gstreamer": cv2.CAP_GSTREAMER,
+        "dshow": cv2.CAP_DSHOW,
+        "mf": cv2.CAP_MSMF
+    }
+    backend = backend_map[args.backend]
+
+    cam_arg = int(args.cam) if args.cam.isdigit() else args.cam
+
+    if args.fourcc:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*args.fourcc))
+    if args.width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
+    if args.height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    if args.fps:
+        cap.set(cv2.CAP_PROP_FPS, args.fps)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera: {args.cam}")
 
     torch.backends.cudnn.benchmark = True
     device = torch.device(args.device)
