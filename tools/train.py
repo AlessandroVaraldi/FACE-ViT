@@ -68,6 +68,7 @@ def build_targets(batch_boxes: List[torch.Tensor], img_size: int, patch: int, de
     for b, boxes in enumerate(batch_boxes):
         if boxes.numel() == 0: 
             continue
+        cell_best = {}
         for (x1, y1, x2, y2) in boxes:
             cx = (x1 + x2) * 0.5 / img_size
             cy = (y1 + y2) * 0.5 / img_size
@@ -76,6 +77,10 @@ def build_targets(batch_boxes: List[torch.Tensor], img_size: int, patch: int, de
             gx = int(min(max((cx * img_size) // patch, 0), G - 1))
             gy = int(min(max((cy * img_size) // patch, 0), G - 1))
             idx = gy * G + gx
+            area = (x2 - x1) * (y2 - y1)
+            if (idx not in cell_best) or (area > cell_best[idx][0]):
+                cell_best[idx] = (area, (cx, cy, w, h))
+        for idx, (_area, (cx, cy, w, h)) in cell_best.items():
             y_p[b, idx] = 1.0
             y_b[b, idx, :] = torch.tensor([cx, cy, w, h], device=device)
     return y_p, y_b
@@ -234,10 +239,6 @@ def train_one_epoch(model, loader, opt, scaler, scheduler, ema, args, device, ep
 @torch.no_grad()
 def validate(model, loader, args, device, use_ema=True):
     model.eval()
-    net = model if not (hasattr(model, "module")) else model.module
-
-    if hasattr(net, "_ema_src") and use_ema:
-        pass
 
     loss_m, loss_c_m, loss_b_m = 0.0, 0.0, 0.0
     TP = FP = FN = 0
@@ -477,13 +478,14 @@ def evaluate_test(args, trained_model, device):
     total_gts = {float(t): 0 for t in iou_thresholds}
 
     # per AP accumuliamo predizioni globalmente
-    # records: lista di dict {score, img_id, gt_idx_best, iou_best}
+    # records: lista di dict {score, img_key, gt_idx_best, iou_best}
     records = []
 
     # per P/R/F1 a soglia fissa
     TP = FP = FN = 0
 
     # ---- inferenza ----
+    img_idx_global = 0 
     for img_batch, gt_list in dl:
         if isinstance(img_batch, (list, tuple)):
             imgs = torch.stack(img_batch, dim=0)
@@ -497,6 +499,7 @@ def evaluate_test(args, trained_model, device):
 
         B, N = scores_all.shape
         for b in range(B):
+            img_key = img_idx_global + b  # ID immagine consistente globalmente
             scores = scores_all[b]            # (N,)
             boxes01 = boxes01_all[b]          # (N,4) cxcywh
             gt = gt_list[b].to(torch.float32) # (M,4) xyxy (canvas)
@@ -519,15 +522,10 @@ def evaluate_test(args, trained_model, device):
                     ious = box_iou_xyxy(bx_pix, gt)  # (K,M)
                     iou_best, gt_best = ious.max(dim=1)
                     for k in range(bx_pix.shape[0]):
-                        records.append(dict(score=float(sc[k]), img_id=len(records),  # unique per record
-                                            img_idx=len(records),  # dummy unique; not used for 'used' key below
-                                            gt_idx_best=int(gt_best[k].item()),
-                                            iou_best=float(iou_best[k].item()),
-                                            image_id_global=b))  # b dentro batch; sostituito sotto
+                        records.append(dict(score=float(sc[k]), img_key=img_key, gt_idx_best=int(gt_best[k].item()), iou_best=float(iou_best[k].item())))
                 else:
                     for k in range(bx_pix.shape[0]):
-                        records.append(dict(score=float(sc[k]), img_id=len(records),
-                                            img_idx=len(records), gt_idx_best=-1, iou_best=0.0, image_id_global=b))
+                        records.append(dict(score=float(sc[k]), img_key=img_key, gt_idx_best=-1, iou_best=0.0))
             # --- P/R/F1 @conf_thr (con NMS) ----
             keep = torch.nonzero(scores > conf_thr, as_tuple=False).flatten()
             if keep.numel():
@@ -570,15 +568,11 @@ def evaluate_test(args, trained_model, device):
         # ordina predizioni per score desc
         recs = sorted(records, key=lambda r: -r["score"])
         tp_flags = []
-        used_pairs = set()  # (image_index_global, gt_idx)
+        used_pairs = set()  # (img_key, gt_idx)
         for r in recs:
-            # NOTA: records sono creati per-batch. 'image_id_global' è b nel batch,
-            # ma poiché le immagini cambiano ogni batch, basta usare (id progressivo, gt_idx) come chiave unica.
-            # Usiamo 'img_id' (progressivo globale) come image key.
-            img_key = r["img_id"]
-            if r["gt_idx_best"] >= 0 and r["iou_best"] >= thr and (img_key, r["gt_idx_best"]) not in used_pairs:
+            if r["gt_idx_best"] >= 0 and r["iou_best"] >= thr and (r["img_key"], r["gt_idx_best"]) not in used_pairs:
                 tp_flags.append(1)
-                used_pairs.add((img_key, r["gt_idx_best"]))
+                used_pairs.add((r["img_key"], r["gt_idx_best"]))
             else:
                 tp_flags.append(0)
         if len(tp_flags) == 0:
@@ -603,6 +597,7 @@ def evaluate_test(args, trained_model, device):
 
     print(f"[TEST] images={len(ds)}  conf={conf_thr}  nms={nms_iou}  max_det={max_det}")
     print(f"[TEST] P {precision:.3f}  R {recall:.3f}  F1 {f1:.3f}  |  mAP@0.5 {ap_05:.3f}  mAP@[.5:.95] {map_5095:.3f}")
+    img_idx_global += B
 
 # ------------------------- Main -------------------------
 def main():
@@ -694,7 +689,11 @@ def main():
     best_metric = float("inf")
     if args.resume and Path(args.resume).exists():
         ckpt = torch.load(args.resume, map_location="cpu")
-        net.load_state_dict(ckpt["state_dict"])
+        # resume shape-tolerant (compatibile con/ senza torch.compile)
+        sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+        msd = net.state_dict()
+        new_sd = {k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}
+        net.load_state_dict({**msd, **new_sd})
         opt.load_state_dict(ckpt["optimizer"])
         if ckpt.get("scaler") is not None and scaler is not None:
             scaler.load_state_dict(ckpt["scaler"])
@@ -702,16 +701,9 @@ def main():
             ema.load_state_dict(ckpt["ema_state_dict"])
         start_epoch = ckpt.get("epoch", 1)
         best_metric = ckpt.get("best_metric", best_metric)
-        print(f"[resume] ripreso da {args.resume} @ epoch {start_epoch} (best={best_metric:.4f})")
-
-    # Warmup schedule helper
-    def warmup_lr_lambda(it_step, warmup_steps):
-        if warmup_steps <= 0: return 1.0
-        return min(1.0, (it_step + 1) / warmup_steps)
+        print(f"[resume] ripreso da {args.resume} @ epoch {start_epoch} (best={best_metric:.4f}, copied={len(new_sd)}/{len(msd)})")
 
     # Train loop
-    global_step = 0
-    warmup_steps = (len(ld_tr) // max(1, args.accum)) * args.warmup_epochs
     meta_path = Path(args.save_dir) / f"meta_{args.name}.json"
     last_path = Path(args.save_dir) / f"last_{args.name}.pth"
     best_path = Path(args.save_dir) / f"best_{args.name}.pth"
