@@ -190,7 +190,11 @@ def gen_header(cfg: dict,
 
     pe_shift = int(cfg["shifts"]["PE_SHIFT"])
     lines.append(f"#define PE_SHIFT          {pe_shift}")
-    lines.append(f"#define PE_ACT_SCALE_Q24  {int(round(act_scale_pe * (1<<24)))}")
+
+    if "PE_IN_SCALE_Q24" in cfg:
+        lines.append(f"#define PE_IN_SCALE_Q24  {cfg['PE_IN_SCALE_Q24']}")
+    if "PE_OUT_SCALE_Q31" in cfg:
+        lines.append(f"#define PE_OUT_SCALE_Q31 {cfg['PE_OUT_SCALE_Q31']}")
 
     lines += [
         "extern const uint8_t  weights_bin[];",
@@ -321,26 +325,36 @@ def main() -> None:
         w_pe = w_pe.T  # [PATCH_DIM, DMODEL]
 
         q_pe, s_pe = sym_int8_quant(w_pe, per_channel=True, axis=1)
-        w_ofs["W_PE"] = write_array(wfh, q_pe)
+        w_ofs["W_PE"] = write_array(wfh, q_pe, align=16)
 
-        # Compute act-scale used to quantize CLS/APE in PatchEmbed domain
-        pe_shift     = int(cfg["shifts"]["PE_SHIFT"])
-        s_pe_max     = float(np.max(s_pe)) if np.ndim(s_pe) else float(s_pe)
-        act_scale_pe = s_pe_max / float(2 ** pe_shift)
-        sc_q15["PE"]  = to_q15(1.0, float(np.max(s_pe)), cfg["shifts"]["PE_SHIFT"])
+        # --- PatchEmbed scales ---
+        pe_shift    = int(cfg["shifts"]["PE_SHIFT"])
+        s_pe_max    = float(np.max(s_pe)) if np.ndim(s_pe) else float(s_pe)
+
+        # 1) Input patch quantization scale (configurable, default 2.0)
+        pe_in_scale = float(cfg.get("PE_IN_SCALE", 2.0))
+        cfg["PE_IN_SCALE_Q24"] = int(round(pe_in_scale * (1<<24)))
+
+        # 2) SC_PE must include input scale (robust w.r.t. underflow)
+        sc_q15["PE"] = to_q15(pe_in_scale, s_pe_max, pe_shift)
 
         b_pe = get_init(
             TENSORS,
             keys=("embed.proj.bias", "patch_embed.bias", "patch_embed.proj.bias", "embed.bias"),
             debug_all=init_keys
         )
-        w_ofs["B_PE"] = write_array(wfh, quantize_bias(b_pe, s_pe, in_scale=act_scale_pe), align=4)
+        # Bias quantized with input domain scale
+        w_ofs["B_PE"] = write_array(wfh, quantize_bias(b_pe, s_pe, in_scale=pe_in_scale), align=4)
+
+        # 3) Post-PE activation scale for CLS/APE (can be very small)
+        pe_out_scale = (pe_in_scale * s_pe_max) / float(2 ** pe_shift)
+        cfg["PE_OUT_SCALE_Q31"] = int(round(pe_out_scale * (1<<31)))
 
         # CLS token (optional)
         cls = get_init(TENSORS, keys=("cls", "class_token", "cls_token"), required=False, debug_all=init_keys)
         if cls is not None:
             cls = cls.reshape(cfg["DMODEL"]).astype(np.float32)
-            q_cls = quantize_act_global(cls, act_scale_pe)
+            q_cls = quantize_act_global(cls, pe_out_scale)
             w_ofs["CLS_EMB"] = write_array(wfh, q_cls)
 
         # ------------- Blocks -------------
@@ -356,7 +370,7 @@ def main() -> None:
             except KeyError:
                 wqkv = pop_linear_KxN(out_dim=3*int(cfg["DMODEL"]), in_dim=int(cfg["DMODEL"]), tag=f"W_QKV_L{l}") # [DM, 3*DM] = K×N
             q, s = sym_int8_quant(wqkv, per_channel=True, axis=1)        # N=3*DM
-            w_ofs[f"W_QKV_L{l}"] = write_array(wfh, q)
+            w_ofs[f"W_QKV_L{l}"] = write_array(wfh, q, align=16)
             sc_q15[f"QKV_L{l}"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["QKV_SHIFT"])
 
             b = get_init(
@@ -378,7 +392,7 @@ def main() -> None:
             except KeyError:
                 wo = pop_linear_KxN(out_dim=int(cfg["DMODEL"]), in_dim=int(cfg["DMODEL"]), tag=f"W_O_L{l}") # [DM, DM] = K×N
             q, s = sym_int8_quant(wo, per_channel=True, axis=1)
-            w_ofs[f"W_O_L{l}"] = write_array(wfh, q)
+            w_ofs[f"W_O_L{l}"] = write_array(wfh, q, align=16)
             sc_q15[f"MHA_O_L{l}"] = to_q15(1.0, float(np.max(s)), cfg["shifts"]["MHA_O_SHIFT"])
 
             b = get_init(
@@ -400,7 +414,7 @@ def main() -> None:
             except KeyError:
                 w1 = pop_linear_KxN(out_dim=int(cfg["DFF"]), in_dim=int(cfg["DMODEL"]), tag=f"W_FFN1_L{l}") # [DM, DFF] = K×N
             q, s = sym_int8_quant(w1, per_channel=True, axis=1)          # N=DFF
-            w_ofs[f"W_FFN1_L{l}"] = write_array(wfh, q)
+            w_ofs[f"W_FFN1_L{l}"] = write_array(wfh, q, align=16)
             sc_q15[f"FFN1_L{l}"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["FFN_SHIFT1"])
 
             b = get_init(
@@ -422,7 +436,7 @@ def main() -> None:
             except KeyError:
                 w2 = pop_linear_KxN(out_dim=int(cfg["DMODEL"]), in_dim=int(cfg["DFF"]), tag=f"W_FFN2_L{l}") # [DFF, DM] = K×N
             q, s = sym_int8_quant(w2, per_channel=True, axis=1)          # N=DM
-            w_ofs[f"W_FFN2_L{l}"] = write_array(wfh, q)
+            w_ofs[f"W_FFN2_L{l}"] = write_array(wfh, q, align=16)
             sc_q15[f"FFN2_L{l}"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["FFN_SHIFT2"])
 
             b = get_init(
@@ -465,8 +479,8 @@ def main() -> None:
                     b = b.astype(np.float32)
 
                 to_i32 = lambda x: np.round(x * 32768).clip(-32768, 32767).astype(np.int32)
-                w_ofs[f"G_{tag}_L{l}"] = write_array(wfh, to_i32(g))
-                w_ofs[f"B_{tag}_L{l}"] = write_array(wfh, to_i32(b))
+                w_ofs[f"G_{tag}_L{l}"] = write_array(wfh, to_i32(g), align=4)
+                w_ofs[f"B_{tag}_L{l}"] = write_array(wfh, to_i32(b), align=4)
 
         # ---------------------------------------------------------------------
         # Absolute Positional Embedding (APE) — optional
@@ -511,7 +525,7 @@ def main() -> None:
             cfg["TOKENS"] = int(Tt_onnx)
             assert int(cfg["DMODEL"]) == int(Dm_onnx), "DMODEL mismatch vs pos_embed"
             # Quantizza APE nel dominio di PatchEmbed
-            q_pos = quantize_act_global(pos, act_scale_pe).astype(np.int8)
+            q_pos = quantize_act_global(pos, pe_out_scale).astype(np.int8)
             w_ofs["POS_EMB"] = write_array(wfh, q_pos)
 
         # ---------------------------------------------------------------------
@@ -524,7 +538,7 @@ def main() -> None:
         except KeyError:
             w_head = pop_linear_KxN(out_dim=int(cfg["OUT_DIM"]), in_dim=int(cfg["DMODEL"]), tag="HEAD_W")
         q, s   = sym_int8_quant(w_head, per_channel=True, axis=1)     # N=OUT
-        w_ofs["HEAD_W"] = write_array(wfh, q)
+        w_ofs["HEAD_W"] = write_array(wfh, q, align=16)
         sc_q15["HEAD"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["HEAD_SHIFT"])
 
         b_head = get_init(TENSORS,

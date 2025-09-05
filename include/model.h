@@ -12,23 +12,23 @@
 #define MODEL_PATCH_DIM   768
 #define MODEL_LAYERS      12
 #define MODEL_OUT_DIM     5
-#define MODEL_EPS_SHIFT 12
+#define MODEL_EPS_SHIFT   12
 
-#define PE_SHIFT       17
-#define QKV_SHIFT      15
-#define ATT_SHIFT      8
-#define MHA_O_SHIFT    15
-#define FFN_SHIFT1     15
-#define FFN_SHIFT2     17
-#define HEAD_SHIFT     15
+#define PE_SHIFT          17   // invariato
+#define QKV_SHIFT         7   // 15 → 9
+#define ATT_SHIFT         8   // invariato
+#define MHA_O_SHIFT       7   // 15 → 9
+#define FFN_SHIFT1        7   // 15 → 9
+#define FFN_SHIFT2        9   // 17 → 11
+#define HEAD_SHIFT        13   // 15 → 13
 
-#define ARENA_BYTES      592128
-#define ARENA_OFF_BUF0   0
-#define ARENA_OFF_BUF1   65792
-#define ARENA_OFF_Q      131584
-#define ARENA_OFF_K      197376
-#define ARENA_OFF_V      263168
-#define ARENA_OFF_TMP    328960
+#define ARENA_BYTES       592128
+#define ARENA_OFF_BUF0    0
+#define ARENA_OFF_BUF1    65792
+#define ARENA_OFF_Q       131584
+#define ARENA_OFF_K       197376
+#define ARENA_OFF_V       263168
+#define ARENA_OFF_TMP     328960
 
 #define OFF_B_FFN1_L0     726016
 #define OFF_B_FFN1_L1     1525760
@@ -217,7 +217,7 @@
 #define SC_MHA_O_L7    30
 #define SC_MHA_O_L8    32
 #define SC_MHA_O_L9    446
-#define SC_PE          14
+#define SC_PE          28
 #define SC_QKV_L0      31
 #define SC_QKV_L1      37
 #define SC_QKV_L10     46
@@ -235,6 +235,9 @@
 #define MODEL_PATCH      16
 #define MODEL_PATCHES   256
 #define MODEL_GRID      16
+#define PE_SHIFT          17
+#define PE_IN_SCALE_Q24  33554432
+#define PE_OUT_SCALE_Q31 14
 extern const uint8_t  weights_bin[];
 
 #endif /* MODEL_H_ */

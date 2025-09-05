@@ -186,22 +186,33 @@ def main():
     ap.add_argument("--nms", type=float, default=None, help="override NMS IoU")
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--view", choices=["original","canvas"], default="original")
-
-    # Camera-related args
+    # Camera args
     ap.add_argument("--cam", type=str, default="0",
-                    help="Camera index (e.g. '0') OR device path (e.g. '/dev/video2') OR a GStreamer pipeline string")
+                    help="Camera index (e.g. '0') OR device path (e.g. '/dev/video0') OR a GStreamer pipeline string")
     ap.add_argument("--backend", choices=["auto", "v4l2", "gstreamer", "dshow", "mf"], default="v4l2",
                     help="Capture backend to use")
     ap.add_argument("--fourcc", type=str, default="", help="Pixel format, e.g. MJPG, YUY2, H264 (if supported)")
     ap.add_argument("--fps", type=int, default=0, help="Try to set FPS (0 = leave default)")
-
     args = ap.parse_args()
 
-    # Enable CuDNN auto-tuner (for convs) and select device
+    import re
+    def is_gst_pipeline(s: str) -> bool:
+        return isinstance(s, str) and ("!" in s or s.strip().startswith(("v4l2src", "filesrc", "videotestsrc")))
+    def normalize_cam(cam: str, backend: str):
+        # Convert '/dev/videoX' to integer index for V4L2/CAP_ANY backends
+        if cam.isdigit():
+            return int(cam)
+        if cam.startswith("/dev/video"):
+            m = re.search(r"/dev/video(\d+)$", cam)
+            if m and backend in ("v4l2", "auto"):
+                return int(m.group(1))
+        return cam
+
+    # CuDNN auto-tuner + device
     torch.backends.cudnn.benchmark = True
     device = torch.device(args.device)
 
-    # Map backend string to OpenCV constant
+    # Backend map
     backend_map = {
         "auto": cv2.CAP_ANY,
         "v4l2": cv2.CAP_V4L2,
@@ -211,13 +222,58 @@ def main():
     }
     backend = backend_map[args.backend]
 
-    # Parse camera argument: int index or string path/pipeline
-    cam_arg = int(args.cam) if args.cam.isdigit() else args.cam
+    # Prepare camera argument and attempts
+    cam_arg = normalize_cam(args.cam, args.backend)
+    attempts = []
 
-    # Open capture with chosen backend
-    cap = cv2.VideoCapture(cam_arg, backend)
+    if args.backend == "v4l2":
+        # Prefer integer index for V4L2
+        if isinstance(cam_arg, int):
+            attempts.append(("v4l2:index", cam_arg, cv2.CAP_V4L2))
+            attempts.append(("any:index",  cam_arg, cv2.CAP_ANY))
+        elif isinstance(cam_arg, str) and cam_arg.startswith("/dev/video"):
+            # If user insisted on path, still try it, then CAP_ANY with index
+            attempts.append(("v4l2:path", cam_arg, cv2.CAP_V4L2))
+            m = re.search(r"/dev/video(\d+)$", cam_arg)
+            if m:
+                idx = int(m.group(1))
+                attempts.append(("any:index", idx, cv2.CAP_ANY))
+        else:
+            attempts.append(("v4l2:arg", cam_arg, cv2.CAP_V4L2))
+    elif args.backend == "gstreamer":
+        attempts.append(("gst:arg", cam_arg, cv2.CAP_GSTREAMER))
+        if isinstance(cam_arg, str) and cam_arg.startswith("/dev/video") and not is_gst_pipeline(cam_arg):
+            # Build a simple v4l2src pipeline as fallback
+            caps = []
+            if args.width and args.height:
+                caps.append(f"width={args.width},height={args.height}")
+            if args.fps:
+                caps.append(f"framerate={args.fps}/1")
+            caps_str = ",".join(caps)
+            if caps_str:
+                caps_str = "," + caps_str
+            gst_pipe = f"v4l2src device={cam_arg} ! video/x-raw{caps_str} ! videoconvert ! appsink"
+            attempts.append(("gst:auto-pipe", gst_pipe, cv2.CAP_GSTREAMER))
+    else:
+        # auto / other backends
+        attempts.append(("any:arg", cam_arg, cv2.CAP_ANY))
 
-    # Try to configure stream properties (apply if supported)
+    # Try to open capture
+    cap = None
+    chosen = None
+    for tag, arg, be in attempts:
+        cap_try = cv2.VideoCapture(arg, be)
+        if cap_try.isOpened():
+            cap = cap_try
+            chosen = (tag, arg, be)
+            break
+        cap_try.release()
+
+    if cap is None:
+        raise RuntimeError(f"Cannot open camera: {args.cam} (backend={args.backend}). "
+                           f"Tried: {[(t,a) for t,a,_ in attempts]}")
+
+    # Configure stream properties
     if args.fourcc:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*args.fourcc))
     if args.width:
@@ -226,9 +282,7 @@ def main():
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     if args.fps:
         cap.set(cv2.CAP_PROP_FPS, args.fps)
-
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera: {args.cam} (backend={args.backend})")
+    print(f"[camera] opened via {chosen[0]} -> {chosen[1]}")
 
     # Load model + thresholds
     model, img_size, conf_thr0, nms_iou0, amp_dtype = load_model(
@@ -257,9 +311,9 @@ def main():
                 dtype=amp_dtype,
                 enabled=(amp_dtype is not None and device.type == "cuda")
             ):
-                p_logits, boxes01 = model(inp)           # (1,N), (1,N,4)
-                scores = torch.sigmoid(p_logits[0])      # (N,)
-                boxes01 = boxes01[0]                     # (N,4)
+                p_logits, boxes01 = model(inp)
+                scores = torch.sigmoid(p_logits[0])
+                boxes01 = boxes01[0]
 
             keep = torch.nonzero(scores > conf_thr, as_tuple=False).flatten()
             if keep.numel() > 0:
@@ -277,7 +331,6 @@ def main():
                 boxes_canvas = np.empty((0,4), dtype=np.float32)
                 scores_np = np.empty((0,), dtype=np.float32)
 
-            # Choose view & draw
             if view_mode == "original":
                 img_show = frame_bgr.copy()
                 if boxes_canvas.size:
@@ -288,7 +341,6 @@ def main():
                 if boxes_canvas.size:
                     draw_boxes(img_show, boxes_canvas, scores_np, conf_thr)
 
-            # HUD
             t_now = time.time()
             fps = 1.0 / max(t_now - t_prev, 1e-9)
             t_prev = t_now

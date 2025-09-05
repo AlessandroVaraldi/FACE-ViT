@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "kernel.h"   // matmul_int8, fused_qkv_int8, mha_int8, ffn_int8, layernorm_int8, sat8
 #include "model.h"
@@ -921,6 +922,21 @@ static inline void add_pos_emb(qint8_t *tokens)
 }
 
 /* =============================== Transformer block =============================== */
+static void stats_i8(const char *tag, const qint8_t *x, size_t len){
+    int minv = 127, maxv = -128, satp = 0, satn = 0;
+    long long sum = 0;
+    for (size_t i = 0; i < len; ++i){
+        int v = x[i];
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
+        if (v == 127)  ++satp;
+        if (v == -128) ++satn;
+        sum += v;
+    }
+    fprintf(stderr, "[%s] min=%d max=%d sat+=%d sat-=%d mean=%.3f\n",
+            tag, minv, maxv, satp, satn, (double)sum / (double)len);
+}
+
 static void transformer_block(size_t l, qint8_t *inp, qint8_t *out)
 {
     const qint8_t  *Wqkv = W_QKV [l];
@@ -939,10 +955,14 @@ static void transformer_block(size_t l, qint8_t *inp, qint8_t *out)
 
     const size_t vec_sz = (size_t)TOKENS * (size_t)DMODEL;
 
+    stats_i8("in.LN1-in", inp, vec_sz);
+
     qint8_t *skip1 = tmp_ffn;
     memcpy(skip1, inp, vec_sz);
 
     layernorm_tokens(inp, g1, b1);
+
+    stats_i8("in.LN1-out", inp, vec_sz);
 
     /* QKV projection (fused) — scalar scale for now */
     fused_qkv_int8(inp, Wqkv, Bqkv, q_buf, k_buf, v_buf, TOKENS, SC_QKV_scalar[l]);
@@ -950,17 +970,27 @@ static void transformer_block(size_t l, qint8_t *inp, qint8_t *out)
        fused_qkv_int8_pc(inp, Wqkv, Bqkv, q_buf, k_buf, v_buf, TOKENS,
                          SCV_QKV[l], SC_LEN_QKV); */
 
+    stats_i8("q", q_buf, vec_sz);
+    stats_i8("k", k_buf, vec_sz);
+    stats_i8("v", v_buf, vec_sz);
+
     /* Multi-head attention (online softmax assumed) */
     mha_int8(q_buf, k_buf, v_buf, out, TOKENS, HEADS, SC_QKV_scalar[l]);
     /* If/when per-channel for attention internals:
        mha_int8_pc(q_buf, k_buf, v_buf, out, TOKENS, HEADS, SCV_QKV[l], SC_LEN_QKV); */
 
+    stats_i8("mha", out, vec_sz);
+
     /* Output projection */
     matmul_int8(out, Wo, Bo, tmp_ffn, TOKENS, DMODEL, DMODEL, SC_MHAO_scalar[l]);
     memcpy(out, tmp_ffn, vec_sz);
 
+    stats_i8("projO", out, vec_sz);
+
     /* Residual add */
     for (size_t i = 0; i < vec_sz; ++i) out[i] = sat8((int32_t)skip1[i] + (int32_t)out[i]);
+
+    stats_i8("res1", out, vec_sz);
 
     /* FFN */
     qint8_t *skip2 = q_buf;
@@ -968,11 +998,15 @@ static void transformer_block(size_t l, qint8_t *inp, qint8_t *out)
 
     layernorm_tokens(out, g2, b2);
 
+    stats_i8("in.LN2-out", out, vec_sz);
+
     /* ffn_int8 does: out = GELU(out*W1+B1) * W2 + B2 (int-only approx inside) */
     ffn_int8(out, W1, B1, W2, B2, tmp_ffn, out, TOKENS, SC_FFN1_scalar[l], SC_FFN2_scalar[l]);
     /* If/when per-channel:
        ffn_int8_pc(out, W1, B1, W2, B2, tmp_ffn, out, TOKENS,
                    SCV_FFN1[l], SC_LEN_FFN1, SCV_FFN2[l], SC_LEN_FFN2); */
+
+    stats_i8("res2", out, vec_sz);
 
     for (size_t i = 0; i < vec_sz; ++i) out[i] = sat8((int32_t)skip2[i] + (int32_t)out[i]);
 }
@@ -1022,6 +1056,15 @@ void vit_init(void)
         SCV_FFN2[l] = PTR_OR_NULL_I16(off_sc_ffn2);
     }
 
+    for (size_t l = 0; l < LAYERS; ++l) {
+        int s_qkv  = (int)SC_QKV_scalar[l];
+        int s_mhao = (int)SC_MHAO_scalar[l];
+        int s_f1   = (int)SC_FFN1_scalar[l];
+        int s_f2   = (int)SC_FFN2_scalar[l];
+        fprintf(stderr, "[sc] L%zu: QKV=%d MHAO=%d FFN1=%d FFN2=%d  (HEAD=%d PE=%d)\n",
+                l, s_qkv, s_mhao, s_f1, s_f2, (int)SC_HEAD_scalar(), (int)SC_PE_scalar());
+    }
+
 #if defined(OFF_SC_HEAD)
     SCV_HEAD = PTR_I16(OFF_SC_HEAD);
 #else
@@ -1040,6 +1083,8 @@ void vit_forward(const qint8_t *inp_patches,
     patch_embed(inp_patches);
     add_pos_emb(bufA);
 
+    stats_i8("PE", bufA, (size_t)TOKENS*DMODEL);
+
     qint8_t *cur  = bufA;
     qint8_t *next = bufB;
 
@@ -1053,4 +1098,12 @@ void vit_forward(const qint8_t *inp_patches,
     /* If/when per-channel head is supported:
        matmul_int8_pc(cur, HEAD_W, HEAD_B, out_head, TOKENS, OUT_DIM, DMODEL,
                       SCV_HEAD, SC_LEN_HEAD); */
+}
+
+void vit_forward_pe_only(const int8_t *inp_patches, int8_t *out_head)
+{
+    patch_embed(inp_patches);
+    add_pos_emb(bufA);
+    // Head per-token direttamente su bufA
+    matmul_int8(bufA, HEAD_W, HEAD_B, out_head, TOKENS, OUT_DIM, DMODEL, SC_HEAD_scalar());
 }
