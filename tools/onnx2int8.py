@@ -190,7 +190,12 @@ def gen_header(cfg: dict,
 
     pe_shift = int(cfg["shifts"]["PE_SHIFT"])
     lines.append(f"#define PE_SHIFT          {pe_shift}")
-    lines.append(f"#define PE_ACT_SCALE_Q24  {int(round(act_scale_pe * (1<<24)))}")
+
+    if "PE" in sc_q15:
+        act_scale_pe = (float(sc_q15["PE"]) / 32768.0) / float(1 << pe_shift)
+        lines.append(f"#define PE_ACT_SCALE_Q24  {int(round(act_scale_pe * (1<<24)))}")
+    else:
+        lines.append(f"/* PE_ACT_SCALE_Q24 not available: missing SC_PE */")
 
     lines += [
         "extern const uint8_t  weights_bin[];",
@@ -293,7 +298,30 @@ def main() -> None:
         for k, src in added:
             print(f"[LayerNorm] aliased {src} -> {k}")
 
+    def _alias_ln_beta_from_constants(TENSORS: Dict[str, np.ndarray], cfg: dict):
+        dm = int(cfg["DMODEL"]); L = int(cfg["LAYERS"])
+        added = []
+        for l in range(L):
+            for ln_alias in ("ln1", "ln2"):
+                key = f"layers.{l}.{ln_alias}.b"
+                if key in TENSORS:
+                    continue
+                prefixes = (f"/layers.{l}/{ln_alias}/Constant",
+                            f"layers.{l}/{ln_alias}/Constant",
+                            f"layers.{l}.{ln_alias}.Constant")
+                cands = [name for name, arr in TENSORS.items()
+                         if isinstance(arr, np.ndarray)
+                         and any(name.startswith(p) for p in prefixes)
+                         and arr.ndim == 1 and arr.shape[0] == dm
+                         and np.issubdtype(arr.dtype, np.floating)]
+                if len(cands) == 1:
+                    TENSORS[key] = TENSORS[cands[0]].astype(np.float32)
+                    added.append((key, cands[0]))
+        for k, src in added:
+            print(f"[LayerNorm] aliased {src} -> {k} (beta)")
+
     _alias_ln_gamma_from_constants(TENSORS, cfg)
+    _alias_ln_beta_from_constants(TENSORS, cfg)
 
     w_ofs: Dict[str, int] = {}
     sc_q15: Dict[str, int] = {}
@@ -523,6 +551,8 @@ def main() -> None:
                             debug_all=init_keys).T
         except KeyError:
             w_head = pop_linear_KxN(out_dim=int(cfg["OUT_DIM"]), in_dim=int(cfg["DMODEL"]), tag="HEAD_W")
+        if "OUT_DIM" not in cfg:
+            cfg["OUT_DIM"] = int(w_head.shape[1])
         q, s   = sym_int8_quant(w_head, per_channel=True, axis=1)     # N=OUT
         w_ofs["HEAD_W"] = write_array(wfh, q)
         sc_q15["HEAD"]  = to_q15(1.0, float(np.max(s)), cfg["shifts"]["HEAD_SHIFT"])

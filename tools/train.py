@@ -607,7 +607,7 @@ def main():
     ap.add_argument("--img-size", type=int, default=256)
     ap.add_argument("--patch", type=int, default=16)
     ap.add_argument("--dim", type=int, default=256)
-    ap.add_argument("--layers", type=int, default=12)
+    ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--dff", type=int, default=1024)
     ap.add_argument("--drop-path", type=float, default=0.0)
